@@ -1,344 +1,374 @@
 import time
 import json
+import re
+import random
+from typing import Dict, List, Tuple
 import pandas as pd
+import requests
+from requests.exceptions import RequestException
 from fake_useragent import UserAgent
 from datetime import datetime
+from bs4 import BeautifulSoup
 
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support.ui import WebDriverWait, Select
-from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from ratelimit import limits, sleep_and_retry
+from tqdm import tqdm
 
 from logger_config import setup_logger, log_method
 from parser import CaixaPropertyParser, CaixaHtmlExtractor
 logger = setup_logger(name="scraper_caixa", log_file="scraper_caixa.log")
 
+
+BASE_URL = "https://venda-imoveis.caixa.gov.br"
+SISTEMA = f"{BASE_URL}/sistema"
+BUSCA_URL = f"{SISTEMA}/busca-imovel.asp?sltTipoBusca=imoveis"
+URL_CIDADES = f"{SISTEMA}/carregaListaCidades.asp"
+URL_BAIRROS = f"{SISTEMA}/carregaListaBairros.asp"
+URL_PESQUISA = f"{SISTEMA}/carregaPesquisaImoveis.asp"
+URL_LISTA = f"{SISTEMA}/carregaListaImoveis.asp"
+
+# Fallback conhecido
+CITY_CODE_OVERRIDES: Dict[Tuple[str, str], str] = {
+    ("SP", "SAO PAULO"): "9859",
+}
+
+
 class CaixaScraperSP:
 
     def __init__(self, estado="SP", cidade="SAO PAULO"):
-        self.base_url = "https://venda-imoveis.caixa.gov.br"
-        self.search_url = f"{self.base_url}/sistema/busca-imovel.asp"
+        self.base_url = BASE_URL
+        self.search_url = BUSCA_URL
         self.ua = UserAgent()
-        self.delay_between_requests = 2  # segundos
+        self.delay_between_requests = 0.5  # segundos
         self.scraped_properties = []
-        self.driver = None
-        
+        self.session = None
+
         # Configurar logger para esta instância
         self.logger = logger
-        
-        # Inicializar parser e extrator
+
+        # Inicializar parser e extrator (mantidos)
         self.parser = CaixaPropertyParser()
         self.html_extractor = CaixaHtmlExtractor(self.parser)
-        
+
         # Parâmetros configuráveis
         self.estado = estado
         self.cidade = cidade
         self.search_params = {
-            'sltTipoBusca': 'imoveis',
-            'sltEstado': estado,
-            'sltCidade': cidade
+            'estado': estado,
+            'cidade': cidade
         }
-        
-        logger.info(f"Scraper configurado para Estado: {estado}, Cidade: {cidade}")
-    
-    @log_method
-    def setup_selenium(self):
-        """Configura o driver do Selenium"""
-        chrome_options = Options()
-        chrome_options.add_argument("--headless")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("--disable-gpu")
-        chrome_options.add_argument("--window-size=1920,1080")
-        chrome_options.add_argument(f"--user-agent={self.ua.random}")
-        
-        # Usar WebDriver Manager
-        service = Service(ChromeDriverManager().install())
-        self.driver = webdriver.Chrome(service=service, options=chrome_options)
-        
-        return True
-    
-    @log_method
-    def extract_bairros_disponiveis(self):
-        """Extrai a lista de bairros disponíveis do elemento #listabairros"""
-        return self.html_extractor.extract_bairros_from_html(self.driver)
-    
-    @log_method
-    def navigate_to_results_with_selenium(self):
 
-        url = f"{self.search_url}?sltTipoBusca=imoveis"
-        self.driver.get(url)
-        
-        # Aguardar carregamento
-        WebDriverWait(self.driver, 10).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
-        
-        # Preencher Estado
-        logger.info(f"Selecionando estado {self.estado}...")
-        estado_select = Select(self.driver.find_element(By.NAME, "cmb_estado"))
-        estado_select.select_by_value(self.estado)
-        time.sleep(3)  # Aguardar carregamento das cidades
-        
-        # Listar opções de cidade disponíveis
-        logger.info("Listando cidades disponíveis...")
-        cidade_select = Select(self.driver.find_element(By.NAME, "cmb_cidade"))
-        options = cidade_select.options
-        for option in options[:10]:  # Mostrar primeiras 10
-            logger.info(f"Cidade opção: value='{option.get_attribute('value')}' text='{option.text}'")
-        
-        # Buscar e selecionar a cidade especificada
-        cidade_found = False
-        for option in options:
-            if option.text == self.cidade:
-                logger.info(f"Selecionando cidade: {option.text}")
-                cidade_select.select_by_visible_text(option.text)
-                cidade_found = True
-                break
-        
-        if not cidade_found:
-            raise Exception(f"Cidade '{self.cidade}' não encontrada nas opções disponíveis")
-        
-        time.sleep(2)
-        
-        # Extrair bairros disponíveis após selecionar estado e cidade
-        logger.info("Extraindo lista de bairros disponíveis...")
-        self.extract_bairros_disponiveis()
-        
-        # Clicar no botão "Próximo" - com tratamento para overlays
-        logger.info("Clicando no botão Próximo...")
+        logger.info(f"Scraper configurado para Estado: {estado}, Cidade: {cidade}")
+
+    # --- Sessão HTTP e utilitários ---
+    def _init_session(self):
+        if self.session is None:
+            s = requests.Session()
+            ua = self.ua.random
+            s.headers.update({
+                "User-Agent": ua,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Connection": "keep-alive",
+                "Referer": self.search_url,
+                "Origin": BASE_URL,
+                "Upgrade-Insecure-Requests": "1",
+            })
+            # Primeira visita para cookies/session
+            s.get(self.search_url, timeout=30)
+            self.session = s
+
+    def _refresh_session(self):
+        """Gera uma nova sessão e UA para tentar evitar bloqueios de bot manager."""
         try:
-            # Primeiro, tentar fechar qualquer modal/overlay que possa estar aberto
-            overlays = self.driver.find_elements(By.CLASS_NAME, "ui-widget-overlay")
-            if overlays:
-                logger.info("Detectado overlay, tentando fechar...")
-                # Tentar clicar fora do overlay ou pressionar ESC
-                self.driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
-                time.sleep(1)
-            
-            # Tentar diferentes estratégias para clicar no botão
-            next_button = self.driver.find_element(By.ID, "btn_next0")
-            
-            # Estratégia 1: Scroll até o elemento e clique normal
-            self.driver.execute_script("arguments[0].scrollIntoView(true);", next_button)
-            time.sleep(1)
-            next_button.click()
-            
-        except Exception as click_error:
-            logger.warning(f"Clique normal falhou: {click_error}")
-            try:
-                # Estratégia 2: JavaScript click
-                logger.info("Tentando clique via JavaScript...")
-                next_button = self.driver.find_element(By.ID, "btn_next0")
-                self.driver.execute_script("arguments[0].click();", next_button)
-                
-            except Exception as js_error:
-                logger.warning(f"Clique JavaScript falhou: {js_error}")
-                try:
-                    # Estratégia 3: Aguardar elemento ser clicável
-                    logger.info("Aguardando elemento ser clicável...")
-                    next_button = WebDriverWait(self.driver, 10).until(
-                        EC.element_to_be_clickable((By.ID, "btn_next0"))
-                    )
-                    next_button.click()
-                    
-                except Exception as wait_error:
-                    logger.error(f"Todas as estratégias de clique falharam: {wait_error}")
-                    raise
-        
-        # Aguardar transição para próxima etapa
-        time.sleep(3)
-        
-        # Verificar se há um segundo "Próximo" ou botão de busca
-        try:
-            # Procurar por botões na segunda etapa
-            buttons = self.driver.find_elements(By.XPATH, "//button[contains(@class, 'submit')]")
-            for button in buttons:
-                button_text = button.text.lower()
-                if any(word in button_text for word in ['próximo', 'buscar', 'pesquisar']):
-                    logger.info(f"Clicando no botão: {button.text}")
-                    button.click()
-                    time.sleep(3)
-                    break
-        except Exception as e:
-            logger.info(f"Não foi possível encontrar botão adicional: {e}")
-        
-        # Obter HTML da página de resultados
-        page_source = self.driver.page_source
-        
-        # Salvar para debug
-        self.debug_save_html(page_source, "debug_results_selenium.html")
-        
-        return page_source
-    
+            if self.session:
+                self.session.close()
+        except Exception:
+            pass
+        self.session = None
+        # jitter aleatório antes de reabrir
+        time.sleep(0.5 + random.random())
+        self._init_session()
+
+    def _is_captcha(self, text: str) -> bool:
+        if not text:
+            return False
+        t = text[:2048].lower()
+        return ("radware bot manager" in t) or ("captcha" in t and "radware" in t) or ("<title>radware" in t)
+
+    @sleep_and_retry
+    @limits(calls=6, period=1)  # até 6 req/segundo
+    @retry(reraise=True,
+           stop=stop_after_attempt(5),
+           wait=wait_exponential(multiplier=0.5, min=0.5, max=6),
+           retry=retry_if_exception_type(RequestException))
+    def _post(self, url: str, data: dict) -> requests.Response:
+        assert self.session is not None, "Sessão HTTP não inicializada"
+        headers = {
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": self.search_url,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Accept": "*/*",
+        }
+        resp = self.session.post(url, data=data, headers=headers, timeout=30)
+        # Detectar bloqueio/captcha
+        if self._is_captcha(resp.text):
+            logger.warning("CAPTCHA detectado no POST. Renovando sessão e tentando novamente.")
+            self._refresh_session()
+            raise RequestException("captcha")
+        if resp.status_code >= 500:
+            raise RequestException(f"{url} status {resp.status_code}")
+        return resp
+
+    @sleep_and_retry
+    @limits(calls=6, period=1)
+    @retry(reraise=True,
+           stop=stop_after_attempt(5),
+           wait=wait_exponential(multiplier=0.5, min=0.5, max=6),
+           retry=retry_if_exception_type(RequestException))
+    def _get(self, url: str, params: dict = None) -> requests.Response:
+        assert self.session is not None, "Sessão HTTP não inicializada"
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Referer": self.search_url,
+        }
+        resp = self.session.get(url, params=params or {}, headers=headers, timeout=30)
+        if self._is_captcha(resp.text):
+            logger.warning("CAPTCHA detectado no GET. Renovando sessão e tentando novamente.")
+            self._refresh_session()
+            raise RequestException("captcha")
+        if resp.status_code >= 500:
+            raise RequestException(f"{url} status {resp.status_code}")
+        return resp
+
+    def _norm(self, s: str) -> str:
+        return re.sub(r"\s+", " ", (s or "").strip().upper())
+
+    # --- Fluxo HTTP ---
     @log_method
-    def close_selenium(self):
-        """Fecha o driver do Selenium"""
-        if self.driver:
-            self.driver.quit()
-            self.driver = None
-    
+    def _obter_codigo_cidade(self, estado: str, nome_cidade: str) -> str:
+        """Consulta carregaListaCidades.asp para mapear nome -> código."""
+        self._init_session()
+        payload = {
+            "cmb_estado": estado,
+            "cmb_cidade": "",
+            "cmb_tp_venda": "",
+            "cmb_tp_imovel": "",
+            "cmb_area_util": "",
+            "cmb_faixa_vlr": "",
+            "cmb_quartos": "",
+            "cmb_vg_garagem": "",
+            "strValorSimulador": "",
+            "strAceitaFGTS": "",
+            "strAceitaFinanciamento": "",
+        }
+        r = self._post(URL_CIDADES, payload)
+        html = r.text
+        soup = BeautifulSoup(html, 'html.parser')
+        alvo = self._norm(nome_cidade)
+        opt = None
+        for o in soup.find_all('option'):
+            txt = self._norm(o.get_text(" "))
+            if txt == alvo:
+                opt = o
+                break
+        if not opt:
+            # fallback: tentar encontrar parcialmente (início)
+            for o in soup.find_all('option'):
+                txt = self._norm(o.get_text(" "))
+                if alvo in txt:
+                    opt = o
+                    break
+        # Fallback para mapeamento conhecido se não achar ou valor vazio
+        if not opt or not (opt.get('value') or '').strip():
+            override = CITY_CODE_OVERRIDES.get((estado, alvo))
+            if override:
+                logger.info(f"Usando fallback de código de cidade para {estado}/{alvo}: {override}")
+                return override
+            raise ValueError(f"Cidade '{nome_cidade}' não encontrada para estado {estado}")
+        return opt.get('value', '').strip()
+
+    @log_method
+    def _obter_bairros(self, estado: str, cod_cidade: str) -> List[str]:
+        """Consulta carregaListaBairros.asp e alimenta o parser com a lista de bairros (opcional)."""
+        self._init_session()
+        payload = {
+            "cmb_estado": estado,
+            "cmb_cidade": cod_cidade,
+            "hdn_bairro": "",
+            "cmb_tp_venda": "",
+            "cmb_tp_imovel": "",
+            "cmb_area_util": "",
+            "cmb_faixa_vlr": "",
+            "cmb_quartos": "",
+            "cmb_vg_garagem": "",
+            "strValorSimulador": "",
+            "strAceitaFGTS": "",
+            "strAceitaFinanciamento": "",
+        }
+        r = self._post(URL_BAIRROS, payload)
+        soup = BeautifulSoup(r.text, 'html.parser')
+        bairros = []
+        # Os labels carregam o nome legível
+        for lab in soup.find_all('label'):
+            t = self._norm(lab.get_text(" "))
+            if t and len(t) > 2 and t != "SELECIONE":
+                bairros.append(t)
+        # Remover duplicados e ordenar
+        bairros = sorted(list(set(bairros)))
+        self.parser.update_bairros_disponiveis(bairros)
+        logger.info(f"✅ Bairros detectados: {len(bairros)}")
+        return bairros
+
+    @log_method
+    def _iniciar_pesquisa(self, estado: str, cod_cidade: str) -> str:
+        """Chama carregaPesquisaImoveis.asp e retorna o HTML com hdnImovN e metadados."""
+        self._init_session()
+        payload = {
+            "hdn_estado": estado,
+            "hdn_cidade": cod_cidade,
+            "hdn_bairro": "",  # todos
+            "hdn_tp_venda": "",  # modalidade indiferente
+            "hdn_tp_imovel": "",
+            "hdn_area_util": "",
+            "hdn_faixa_vlr": "",
+            "hdn_quartos": "",
+            "hdn_vg_garagem": "",
+            "strValorSimulador": "",
+            "strAceitaFGTS": "",
+            "strAceitaFinanciamento": "",
+        }
+        r = self._post(URL_PESQUISA, payload)
+        return r.text
+
+    def _extrair_ids_e_paginacao(self, html: str) -> Tuple[Dict[int, str], int, int]:
+        """Extrai hdnImovN (por página), total de páginas e total de registros."""
+        soup = BeautifulSoup(html, 'html.parser')
+        ids_por_pagina: Dict[int, str] = {}
+        total_paginas = 1
+        total_registros = 0
+
+        # hdnQtdPag, hdnQtdRegistros
+        try:
+            total_pag_elem = soup.find(id="hdnQtdPag")
+            if total_pag_elem and total_pag_elem.get('value'):
+                total_paginas = int(total_pag_elem.get('value'))
+        except Exception:
+            pass
+        try:
+            total_reg_elem = soup.find(id="hdnQtdRegistros")
+            if total_reg_elem and total_reg_elem.get('value'):
+                total_registros = int(total_reg_elem.get('value'))
+        except Exception:
+            pass
+
+        # hdnImov1..N
+        for inp in soup.find_all('input'):
+            iid = inp.get('id') or ''
+            if iid.startswith('hdnImov'):
+                try:
+                    idx = int(iid.replace('hdnImov', ''))
+                    ids_por_pagina[idx] = (inp.get('value') or '').strip()
+                except Exception:
+                    continue
+        return ids_por_pagina, total_paginas, total_registros
+
+    @log_method
+    def _carregar_pagina_fragmento(self, ids_da_pagina: str) -> str:
+        """Chama carregaListaImoveis.asp e retorna o HTML (fragmento) dessa página."""
+        payload = {"hdnImov": ids_da_pagina}
+        r = self._post(URL_LISTA, payload)
+        return r.text
+
     def debug_save_html(self, html_content, filename="debug_page.html"):
         """Salva HTML para debug"""
         with open(filename, 'w', encoding='utf-8') as f:
             f.write(html_content)
         logger.info(f"HTML salvo para debug: {filename}")
-    
+
     @log_method
     def extract_properties_from_page(self, html_content):
-        """Extrai todos os imóveis de uma página de resultados"""
+        """Extrai todos os imóveis de uma página de resultados (usa o parser intacto)."""
         return self.html_extractor.extract_properties_from_page(html_content)
-    
-    @log_method
-    def get_pagination_info_selenium(self):
-        """Obtém informações de paginação usando Selenium"""
-        # Buscar campos ocultos com informações de paginação
-        total_pages_element = self.driver.find_element(By.ID, "hdnQtdPag")
-        current_page_element = self.driver.find_element(By.ID, "hdnPagNum")
-        total_properties_element = self.driver.find_element(By.ID, "hdnQtdRegistros")
-        
-        pagination_info = {
-            'total_pages': int(total_pages_element.get_attribute('value')),
-            'current_page': int(current_page_element.get_attribute('value')),
-            'total_properties': int(total_properties_element.get_attribute('value'))
-        }
-        
-        return pagination_info
-    
-    @log_method
-    def navigate_to_next_page_selenium(self, page_number):
-        """Navega para uma página específica usando Selenium"""
-        # A CAIXA usa a função JavaScript carregaListaImoveis(page_number)
-        script = f"carregaListaImoveis({page_number});"
-        logger.info(f"🔄 Executando: {script}")
-        
-        self.driver.execute_script(script)
-        time.sleep(3)  # Aguardar carregamento da página
-        
-        # Verificar se a página mudou verificando o hdnPagNum
-        current_page_element = self.driver.find_element(By.ID, "hdnPagNum")
-        actual_page = int(current_page_element.get_attribute('value'))
-        
-        if actual_page == page_number:
-            logger.info(f"✓ Navegação bem-sucedida para página {page_number}")
-            return True
-        else:
-            logger.warning(f"⚠️ Página esperada: {page_number}, página atual: {actual_page}")
-            return False
 
     @log_method
     def scrape_all_properties(self):
-        """Método principal para extrair todos os imóveis"""
-        properties = self.navigate_with_selenium_all_pages()
+        """Fluxo principal HTTP: navega por todas as páginas e extrai os imóveis."""
+        self._init_session()
+
+        # 1) Descobrir código da cidade e bairros (opcional, para melhorar parser)
+        cod_cidade = self._obter_codigo_cidade(self.estado, self.cidade)
+        try:
+            self._obter_bairros(self.estado, cod_cidade)
+        except Exception as e:
+            logger.warning(f"Falha ao obter bairros: {e}")
+
+        # 2) Iniciar pesquisa e extrair metadados/paginação/ids
+        html_inicio = self._iniciar_pesquisa(self.estado, cod_cidade)
+        self.debug_save_html(html_inicio, "debug_results_http.html")
+        ids_por_pagina, total_paginas, total_registros = self._extrair_ids_e_paginacao(html_inicio)
+
+        if not ids_por_pagina:
+            logger.warning("Não foram encontrados IDs de imóveis por página (hdnImovN)")
+
+        logger.info("📊 Paginação detectada:")
+        logger.info(f"   Total de páginas: {total_paginas}")
+        logger.info(f"   Total de imóveis (site): {total_registros}")
+
+        # 3) Iterar páginas via endpoint carregaListaImoveis.asp
+        all_properties = []
+        for page_num in tqdm(range(1, total_paginas + 1), desc="Páginas", unit="pág"):
+            ids = ids_por_pagina.get(page_num, "")
+            if not ids:
+                logger.warning(f"Sem IDs para a página {page_num}, pulando...")
+                continue
+
+            frag = self._carregar_pagina_fragmento(ids)
+            # O endpoint retorna apenas o innerHTML. Envolver para o parser atual reconhecer
+            wrapped_html = f"<div id='listaimoveispaginacao'>{frag}</div>"
+            properties = self.extract_properties_from_page(wrapped_html)
+            all_properties.extend(properties)
+            time.sleep(self.delay_between_requests)
+
+        self.scraped_properties = all_properties
         logger.info(f"Total de imóveis extraídos: {len(self.scraped_properties)}")
         return self.scraped_properties
-    
-    @log_method
-    def navigate_with_selenium_all_pages(self):
-        """Navega por todas as páginas e extrai todos os imóveis usando Selenium"""
-        self.setup_selenium()
-        if not self.driver:
-            return []
-        
-        all_properties = []
-        
-        try:
-            # Navegar para a primeira página de resultados
-            success = self.navigate_to_results_with_selenium()
-            
-            if not success:
-                raise Exception("Falha ao navegar para a página de resultados")
-            
-            # Extrair da primeira página
-            current_html = self.driver.page_source
-            properties = self.extract_properties_from_page(current_html)
-            all_properties.extend(properties)
-            
-            # Obter informações de paginação
-            pagination_info = self.get_pagination_info_selenium()
-            if not pagination_info:
-                logger.warning("Não foi possível obter informações de paginação")
-                return all_properties
-            
-            current_page = pagination_info['current_page']
-            total_pages = pagination_info['total_pages']
-            total_properties = pagination_info['total_properties']
-            
-            logger.info(f"📊 Paginação detectada:")
-            logger.info(f"   Página atual: {current_page}")
-            logger.info(f"   Total de páginas: {total_pages}")
-            logger.info(f"   Total de imóveis: {total_properties}")
-            
-            # Navegar pelas páginas restantes
-            for page_num in range(2, total_pages + 1):
-                logger.info(f"🔄 Navegando para página {page_num}/{total_pages}...")
-                
-                success = self.navigate_to_next_page_selenium(page_num)
-                if not success:
-                    logger.warning(f"Falha ao navegar para página {page_num}")
-                    break
-                
-                time.sleep(2)
-                
-                current_html = self.driver.page_source
-                properties = self.extract_properties_from_page(current_html)
-                all_properties.extend(properties)
-                
-                logger.info(f"✓ Página {page_num}: {len(properties)} imóveis extraídos")
-                logger.info(f"📈 Total acumulado: {len(all_properties)} imóveis")
-                
-                time.sleep(1)
-                
-                if len(all_properties) >= total_properties:
-                    logger.info(f"Coletados {len(all_properties)} imóveis")
-                    break
-        
-        finally:
-            if self.driver:
-                self.driver.quit()
-                logger.info("Driver selenium parou de rodar (driver.quit())")
-        
-        self.scraped_properties = all_properties
-        return all_properties
 
+    # --- Mantém utilidades de exportação e resumo ---
     @log_method
     def save_to_csv(self, filename=None):
         """Salva os dados extraídos em CSV"""
         if not self.scraped_properties:
             logger.warning("Nenhum dado para salvar")
             return None
-        
+
         if filename is None:
             filename = f"imoveis_{self.estado.lower()}_{self.cidade.lower().replace(' ', '_')}.csv"
-        
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename_with_timestamp = f"{filename.replace('.csv', '')}_{timestamp}.csv"
-        
+
         # Converter para DataFrame
         df = pd.DataFrame(self.scraped_properties)
-        
+
         # Salvar CSV
         df.to_csv(filename_with_timestamp, index=False, encoding='utf-8')
-        
+
         return filename_with_timestamp
-    
+
     @log_method
     def save_to_json(self, filename=None):
         """Salva os dados extraídos em JSON"""
         if not self.scraped_properties:
             logger.warning("Nenhum dado para salvar")
             return None
-        
+
         if filename is None:
             filename = f"imoveis_{self.estado.lower()}_{self.cidade.lower().replace(' ', '_')}.json"
-        
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename_with_timestamp = f"{filename.replace('.json', '')}_{timestamp}.json"
-        
+
         # Preparar dados para JSON
         export_data = {
             'timestamp': datetime.now().isoformat(),
@@ -346,36 +376,36 @@ class CaixaScraperSP:
             'search_parameters': self.search_params,
             'properties': self.scraped_properties
         }
-        
+
         # Salvar JSON
         with open(filename_with_timestamp, 'w', encoding='utf-8') as f:
             json.dump(export_data, f, ensure_ascii=False, indent=2)
-        
+
         return filename_with_timestamp
-    
+
     def print_summary(self):
         """Exibe resumo dos dados extraídos"""
         if not self.scraped_properties:
             print("Nenhum dado extraído.")
             return
-        
+
         print(f"\n=== RESUMO DA EXTRAÇÃO ===")
         print(f"Total de imóveis: {len(self.scraped_properties)}")
-        
+
         # Estatísticas básicas
-        properties_with_value = [p for p in self.scraped_properties if p['valor']]
-        properties_with_address = [p for p in self.scraped_properties if p['endereco']]
-        properties_with_area = [p for p in self.scraped_properties if p['area']]
-        
+        properties_with_value = [p for p in self.scraped_properties if p.get('valor')]
+        properties_with_address = [p for p in self.scraped_properties if p.get('endereco')]
+        properties_with_area = [p for p in self.scraped_properties if p.get('area')]
+
         print(f"Com valor preenchido: {len(properties_with_value)}")
         print(f"Com endereço preenchido: {len(properties_with_address)}")
         print(f"Com área preenchida: {len(properties_with_area)}")
-        
+
         # Mostrar algumas amostras
         print(f"\n=== AMOSTRAS DOS DADOS ===")
         for i, prop in enumerate(self.scraped_properties[:3]):
             print(f"\nImóvel {i+1}:")
-            print(f"  Código: {prop['codigo']}")
-            print(f"  Endereço: {prop['endereco']}")
-            print(f"  Valor: {prop['valor']}")
-            print(f"  Área: {prop['area']}")
+            print(f"  Código: {prop.get('codigo')}")
+            print(f"  Endereço: {prop.get('endereco')}")
+            print(f"  Valor: {prop.get('valor')}")
+            print(f"  Área: {prop.get('area')}")
