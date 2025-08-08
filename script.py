@@ -27,9 +27,11 @@ URL_BAIRROS = f"{SISTEMA}/carregaListaBairros.asp"
 URL_PESQUISA = f"{SISTEMA}/carregaPesquisaImoveis.asp"
 URL_LISTA = f"{SISTEMA}/carregaListaImoveis.asp"
 
-# Fallback conhecido
+# Known city code overrides for common searches
 CITY_CODE_OVERRIDES: Dict[Tuple[str, str], str] = {
     ("SP", "SAO PAULO"): "9859",
+    # Add more common cities as they are discovered
+    # Format: (estado, cidade_normalizada): "codigo"
 }
 
 
@@ -59,6 +61,38 @@ class CaixaScraperSP:
         }
 
         logger.info(f"Scraper configurado para Estado: {estado}, Cidade: {cidade}")
+
+    def list_available_cities(self, estado: str) -> List[str]:
+        """Lista todas as cidades disponíveis para um estado específico."""
+        self._init_session()
+        payload = {
+            "cmb_estado": estado,
+            "cmb_cidade": "",
+            "cmb_tp_venda": "",
+            "cmb_tp_imovel": "",
+            "cmb_area_util": "",
+            "cmb_faixa_vlr": "",
+            "cmb_quartos": "",
+            "cmb_vg_garagem": "",
+            "strValorSimulador": "",
+            "strAceitaFGTS": "",
+            "strAceitaFinanciamento": "",
+        }
+        r = self._post(URL_CIDADES, payload)
+        html = r.text
+        
+        # Extrair todas as opções usando regex
+        import re
+        option_pattern = r"<option value='([^']+)'>([^<]+)"
+        matches = re.findall(option_pattern, html)
+        
+        cities = []
+        for value, city_text in matches:
+            if value and city_text.strip() and city_text.strip().upper() != "SELECIONE":
+                normalized_city = self._norm(city_text.strip())
+                cities.append(normalized_city)
+        
+        return sorted(cities)
 
     # --- Sessão HTTP e utilitários ---
     def _init_session(self):
@@ -164,29 +198,55 @@ class CaixaScraperSP:
         }
         r = self._post(URL_CIDADES, payload)
         html = r.text
-        soup = BeautifulSoup(html, 'html.parser')
+        
+        # O HTML retornado usa <br> ao invés de tags fechadas, então vamos parsear de forma especial
+        # Exemplo: <option value='260'>MANAUS<br><option value='269'>NOVA OLINDA DO NORTE<br>
+        import re
+        
         alvo = self._norm(nome_cidade)
-        opt = None
-        for o in soup.find_all('option'):
-            txt = self._norm(o.get_text(" "))
-            if txt == alvo:
-                opt = o
-                break
-        if not opt:
-            # fallback: tentar encontrar parcialmente (início)
-            for o in soup.find_all('option'):
-                txt = self._norm(o.get_text(" "))
-                if alvo in txt:
-                    opt = o
-                    break
-        # Fallback para mapeamento conhecido se não achar ou valor vazio
-        if not opt or not (opt.get('value') or '').strip():
-            override = CITY_CODE_OVERRIDES.get((estado, alvo))
-            if override:
-                logger.info(f"Usando fallback de código de cidade para {estado}/{alvo}: {override}")
-                return override
-            raise ValueError(f"Cidade '{nome_cidade}' não encontrada para estado {estado}")
-        return opt.get('value', '').strip()
+        
+        # Extrair todas as opções usando regex
+        option_pattern = r"<option value='([^']+)'>([^<]+)"
+        matches = re.findall(option_pattern, html)
+        
+        available_cities = []
+        city_options = {}
+        
+        for value, city_text in matches:
+            if value and city_text.strip() and city_text.strip().upper() != "SELECIONE":
+                normalized_city = self._norm(city_text.strip())
+                available_cities.append(normalized_city)
+                city_options[normalized_city] = value
+        
+        logger.info(f"Cidades disponíveis para {estado}: {available_cities}")
+        
+        # Busca exata primeiro
+        if alvo in city_options:
+            logger.info(f"Encontrada correspondência exata: '{alvo}' -> código {city_options[alvo]}")
+            return city_options[alvo]
+        
+        # Se não encontrou exata, tenta busca parcial (contém)
+        for city_name, city_code in city_options.items():
+            if alvo in city_name:
+                logger.info(f"Encontrada correspondência parcial: '{city_name}' para '{alvo}' -> código {city_code}")
+                return city_code
+        
+        # Se ainda não encontrou, tenta busca reversa (cidade contida no nome buscado)
+        for city_name, city_code in city_options.items():
+            if city_name in alvo:
+                logger.info(f"Encontrada correspondência reversa: '{city_name}' para '{alvo}' -> código {city_code}")
+                return city_code
+        
+        # Fallback para mapeamento conhecido
+        override = CITY_CODE_OVERRIDES.get((estado, alvo))
+        if override:
+            logger.info(f"Usando fallback de código de cidade para {estado}/{alvo}: {override}")
+            return override
+        
+        # Mostrar cidades disponíveis para ajudar na correção
+        logger.error(f"Cidade '{nome_cidade}' não encontrada para estado {estado}")
+        logger.error(f"Cidades disponíveis: {', '.join(available_cities)}")
+        raise ValueError(f"Cidade '{nome_cidade}' não encontrada para estado {estado}. Cidades disponíveis: {', '.join(available_cities)}")
 
     @log_method
     def _obter_bairros(self, estado: str, cod_cidade: str) -> List[str]:
