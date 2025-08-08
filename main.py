@@ -83,10 +83,10 @@ def main():
         imoveis = scraper.scrapeImoveis()
         
         if imoveis:
-            csv_file = scraper.save_to_csv()
-            json_file = scraper.save_to_json()
+            csv_file = scraper.export_CSV()
+            json_file = scraper.export_JSON()
             
-            scraper.print_summary()
+            scraper.print_resumo()
             
             print(f"\n=== ARQUIVOS GERADOS ===")
             print(f"CSV: {csv_file}")

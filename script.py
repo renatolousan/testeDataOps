@@ -385,7 +385,7 @@ class CaixaScraper:
 
     
     @log_method
-    def save_to_csv(self, filename=None):
+    def export_CSV(self, filename=None):
         if not self.imoveis_scraped:
             logger.warning("Nenhum dado para salvar")
             return None
@@ -405,7 +405,7 @@ class CaixaScraper:
         return filename_with_timestamp
 
     @log_method
-    def save_to_json(self, filename=None):
+    def export_JSON(self, filename=None):
         if not self.imoveis_scraped:
             logger.warning("Nenhum dado para salvar")
             return None
@@ -430,7 +430,7 @@ class CaixaScraper:
 
         return filename_with_timestamp
 
-    def print_summary(self):
+    def print_resumo(self):
         if not self.imoveis_scraped:
             print("Nenhum dado extraído.")
             return

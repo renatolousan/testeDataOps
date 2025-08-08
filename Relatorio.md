@@ -1,4 +1,4 @@
-# Sistema de scraping - CAIXA Imóveis
+# Relatório
 
 ## Quais são os principais campos de dados extraídos dos imóveis?
 
@@ -249,7 +249,7 @@
 
 10. **Estruturas Inconsistentes**: Múltiplos parsers e fallbacks
     ```python
-    def extract_imoveis_da_pag(self, html_content):
+    def extract_imoveis_from_page(self, html_content):
         # Estratégia principal
         results_section = soup.find('div', id='listaimoveispaginacao')
         if results_section:
